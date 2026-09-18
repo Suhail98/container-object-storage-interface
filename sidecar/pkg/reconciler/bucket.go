@@ -122,6 +122,8 @@ func (r *BucketReconciler) SetupWithManager(mgr ctrl.Manager) error {
 					// opt in to desired Update events
 					cosipredicate.GenerationChangedInUpdateOnly(), // reconcile spec changes
 					cosipredicate.DeletionTimestampAdded(),
+					// retry a deletion that was refused while the BucketClaim was still live
+					cosipredicate.BucketClaimBeingDeletedAnnotationAdded(),
 					cosipredicate.ProtectionFinalizerRemoved(r.Scheme), // re-add protection finalizer if removed
 				),
 			),
