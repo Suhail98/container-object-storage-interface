@@ -17,10 +17,12 @@ limitations under the License.
 package reconciler_test
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
@@ -32,6 +34,7 @@ import (
 	controller "sigs.k8s.io/container-object-storage-interface/controller/pkg/reconciler"
 	cositest "sigs.k8s.io/container-object-storage-interface/internal/test"
 	sidecartest "sigs.k8s.io/container-object-storage-interface/internal/test/sidecar"
+	cosiproto "sigs.k8s.io/container-object-storage-interface/proto"
 )
 
 var (
@@ -353,6 +356,73 @@ func deletionTestSuiteWithoutBucket(t *testing.T,
 
 	bootstrapped.AssertResourceDoesNotExist(t, cositest.NsName(&baseDynamicClaim), &cosiapi.BucketClaim{})
 	bootstrapped.AssertResourceDoesNotExist(t, cositest.BucketNsName(initClaim), &cosiapi.Bucket{})
+}
+
+// Regression test for the deadlock that occurs when a Bucket is deleted before its BucketClaim's
+// deletion is reconciled. The Sidecar will not release a Bucket that is still bound to a
+// BucketClaim until the controller marks the claim as deleting, so the controller must apply that
+// annotation even when the Bucket is already terminating.
+func TestBucketClaimReconcileDeleteWithDeletingBucket(t *testing.T) {
+	bootstrapped := dynamicInitializationTest(t)
+	ctx := bootstrapped.ContextWithLogger
+	r := claimReconcilerForClient(bootstrapped.Client)
+
+	initClaim, initBucket := getClaimAndBucket(bootstrapped)
+	require.NotNil(t, initBucket)
+
+	// Provision the Bucket with sidecar logic so it carries the protection finalizer it would have
+	// in a live cluster. Without the finalizer the Bucket would disappear as soon as it is deleted.
+	initBucket, err := sidecartest.ReconcileOpinionatedS3Bucket(t, bootstrapped, cositest.NsName(initBucket))
+	require.NoError(t, err)
+	require.Contains(t, initBucket.GetFinalizers(), cosiapi.ProtectionFinalizer)
+	require.Equal(t, cosiapi.BucketDeletionPolicyDelete, initBucket.Spec.DeletionPolicy)
+
+	// Delete the Bucket first, then the BucketClaim.
+	require.NoError(t, r.Delete(ctx, initBucket))
+	require.NoError(t, r.Delete(ctx, initClaim))
+
+	_, bucket := getClaimAndBucket(bootstrapped)
+	require.NotNil(t, bucket)
+	require.NotZero(t, bucket.GetDeletionTimestamp())
+	require.NotContains(t, bucket.GetAnnotations(), cosiapi.BucketClaimBeingDeletedAnnotation)
+
+	// Until the claim is marked as deleting, the Sidecar refuses to release the Bucket.
+	_, err = sidecartest.ReconcileOpinionatedS3Bucket(t, bootstrapped, cositest.NsName(initBucket))
+	require.ErrorContains(t, err, "will not delete Bucket bound to a non-deleting BucketClaim")
+
+	res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: cositest.NsName(&baseDynamicClaim)})
+	assert.Error(t, err) // TODO: should be NoError when Bucket watcher is set up
+	assert.NotErrorIs(t, err, reconcile.TerminalError(nil))
+	assert.ErrorContains(t, err, "waiting for Bucket to be deleted")
+	assert.Empty(t, res)
+
+	claim, bucket := getClaimAndBucket(bootstrapped)
+
+	// The claim keeps its finalizer while it waits, but the Bucket is now annotated.
+	require.NotNil(t, claim)
+	assert.Contains(t, claim.GetFinalizers(), cosiapi.ProtectionFinalizer)
+	require.NotNil(t, bucket)
+	assert.Contains(t, bucket.GetAnnotations(), cosiapi.BucketClaimBeingDeletedAnnotation)
+	assert.Contains(t, bucket.GetFinalizers(), cosiapi.ProtectionFinalizer)
+
+	// The Sidecar can now finish the deletion it previously refused. The helper reports NotFound
+	// because it re-reads the Bucket after the Sidecar removes the protection finalizer.
+	deleteServer := cositest.FakeProvisionerServer{
+		// nolint:lll // long line is fine for test code
+		DeleteBucketFunc: func(ctx context.Context, dbr *cosiproto.DriverDeleteBucketRequest) (*cosiproto.DriverDeleteBucketResponse, error) {
+			return &cosiproto.DriverDeleteBucketResponse{}, nil
+		},
+	}
+	_, err = sidecartest.ReconcileBucket(t, bootstrapped,
+		&deleteServer, sidecartest.OpinionatedS3DriverInfo(), cositest.NsName(initBucket))
+	require.True(t, kerrors.IsNotFound(err), "Bucket should be gone, got error: %v", err)
+	bootstrapped.AssertResourceDoesNotExist(t, cositest.NsName(initBucket), &cosiapi.Bucket{})
+
+	// With the Bucket gone, the next reconcile releases the BucketClaim.
+	res, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: cositest.NsName(&baseDynamicClaim)})
+	assert.NoError(t, err)
+	assert.Empty(t, res)
+	bootstrapped.AssertResourceDoesNotExist(t, cositest.NsName(&baseDynamicClaim), &cosiapi.BucketClaim{})
 }
 
 func TestBucketClaimReconcile(t *testing.T) {
